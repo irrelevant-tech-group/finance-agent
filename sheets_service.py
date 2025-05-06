@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# sheets_service.py - Servicio para acceder a datos de Google Sheets
+# accounting_service.py - Servicio para registrar gastos en la hoja de contabilidad
 
 import os
 import logging
@@ -8,22 +8,24 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
 # Configurar logger
-logger = logging.getLogger("subscription_notifier.sheets")
+logger = logging.getLogger("subscription_notifier.accounting")
 
-class SheetsService:
-    def __init__(self, credentials_file=None, spreadsheet_id=None, sheet_name=None):
+class AccountingService:
+    def __init__(self, credentials_file=None, spreadsheet_id=None, expenses_sheet_name=None, movements_sheet_name=None):
         """
-        Inicializa el servicio de Google Sheets.
+        Inicializa el servicio de contabilidad para registrar gastos.
         
         Args:
             credentials_file (str): Ruta al archivo de credenciales. Si es None, se intenta obtener de las variables de entorno.
             spreadsheet_id (str): ID de la hoja de cálculo. Si es None, se intenta obtener de las variables de entorno.
-            sheet_name (str): Nombre de la hoja. Si es None, se intenta obtener de las variables de entorno.
+            expenses_sheet_name (str): Nombre de la hoja de gastos. Si es None, se intenta obtener de las variables de entorno.
+            movements_sheet_name (str): Nombre de la hoja de movimientos. Si es None, se intenta obtener de las variables de entorno.
         """
         self.credentials_file = credentials_file or os.getenv('GOOGLE_CREDENTIALS_FILE', 'creds.json')
-        self.spreadsheet_id = spreadsheet_id or os.getenv('SPREADSHEET_ID', '1WAEqqx_0OuqXM8Na4eVhKULjJPTSogETP8Dh-3gMUmk')
-        self.sheet_name = sheet_name or os.getenv('SHEET_NAME', 'Gastos Fijos')
-        self.scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+        self.spreadsheet_id = spreadsheet_id or os.getenv('ACCOUNTING_SPREADSHEET_ID', '1e1UQWdcRDDawPjIuHIS0yxQlxtczEdiTPFBltpfymmA')
+        self.expenses_sheet_name = expenses_sheet_name or os.getenv('ACCOUNTING_EXPENSES_SHEET_NAME', 'Gastos')
+        self.movements_sheet_name = movements_sheet_name or os.getenv('ACCOUNTING_MOVEMENTS_SHEET_NAME', 'Movimientos caja')
+        self.scopes = ['https://www.googleapis.com/auth/spreadsheets']  # Necesitamos permisos de escritura
         
         # Verificar que el archivo de credenciales exista
         if not os.path.exists(self.credentials_file):
@@ -45,119 +47,276 @@ class SheetsService:
             logger.error(f"Error al conectar con Google Sheets: {e}")
             return None
     
-    def load_subscriptions(self):
+    def format_date_for_accounting(self, date_obj):
         """
-        Carga las suscripciones desde Google Sheets.
+        Formatea una fecha para la hoja de contabilidad (MM/DD/YYYY).
         
+        Args:
+            date_obj (datetime): Objeto datetime a formatear.
+            
         Returns:
-            list: Lista de diccionarios con los datos de las suscripciones.
+            str: Fecha formateada en el formato MM/DD/YYYY.
+        """
+        return date_obj.strftime("%m/%d/%Y")
+    
+    def extract_numeric_value(self, value_str):
+        """
+        Extrae el valor numérico de un string de moneda.
+        
+        Args:
+            value_str (str): String de moneda (ej: "$100.000").
+            
+        Returns:
+            float: Valor numérico.
+        """
+        if isinstance(value_str, str):
+            # Eliminar el símbolo $ y puntos de miles
+            return float(value_str.replace('$', '').replace('.', '').replace(',', '.'))
+        elif isinstance(value_str, (int, float)):
+            return float(value_str)
+        else:
+            return 0.0
+    
+    def register_expenses(self, subscriptions):
+        """
+        Registra los gastos recurrentes en la hoja de gastos y movimientos de caja.
+        
+        Args:
+            subscriptions (list): Lista de suscripciones a registrar.
+            
+        Returns:
+            bool: True si ambos registros fueron exitosos, False en caso contrario.
+        """
+        if not subscriptions:
+            logger.info("No hay gastos para registrar")
+            return True
+        
+        # Registrar en la hoja de gastos
+        expenses_result = self.register_in_expenses_sheet(subscriptions)
+        
+        # Registrar en la hoja de movimientos de caja
+        movements_result = self.register_in_movements_sheet(subscriptions)
+        
+        return expenses_result and movements_result
+    
+    def register_in_expenses_sheet(self, subscriptions):
+        """
+        Registra los gastos recurrentes en la hoja de gastos.
+        
+        Args:
+            subscriptions (list): Lista de suscripciones a registrar.
+            
+        Returns:
+            bool: True si se registraron correctamente, False en caso contrario.
         """
         try:
             service = self.get_service()
             if not service:
                 logger.error("No se pudo obtener el servicio de Google Sheets")
-                return []
+                return False
             
-            # Obtener los datos de la hoja
-            sheet = service.spreadsheets()
-            result = sheet.values().get(
+            # Fecha actual para el registro
+            today = datetime.now()
+            formatted_date = self.format_date_for_accounting(today)
+            
+            # Preparar los valores a insertar
+            values = []
+            for sub in subscriptions:
+                # Extraer valores numéricos para Google Sheets
+                monto_cop = self.extract_numeric_value(sub.get('montoCOP', '0'))
+                monto_usd = self.extract_numeric_value(sub.get('montoUSD', '0'))
+                
+                # Crear una fila para cada suscripción
+                # [Fecha, Detalle, Categoría, Monto COP (número), Monto USD (número)]
+                row = [
+                    formatted_date,  # Fecha en formato MM/DD/YYYY
+                    sub.get('detalle', 'Sin detalles'),  # Detalle
+                    sub.get('categoria', 'Sin categoría'),  # Categoría
+                    monto_cop,  # Monto COP como número
+                    monto_usd    # Monto USD como número
+                ]
+                values.append(row)
+            
+            # Obtener la siguiente fila disponible
+            result = service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"'{self.sheet_name}'!A:H"  # Asumiendo que los datos están en las columnas A-H
+                range=f"'{self.expenses_sheet_name}'!A:A"
             ).execute()
             
-            values = result.get('values', [])
-            if not values:
-                logger.warning("No se encontraron datos en la hoja de cálculo")
-                return []
+            existing_rows = result.get('values', [])
+            next_row = len(existing_rows) + 1
             
-            # Obtener los encabezados (primera fila)
-            headers = values[0]
-            
-            # Normalizar encabezados (convertir a minúsculas y espacios a guiones bajos)
-            normalized_headers = [h.lower().replace(' ', '_') for h in headers]
-            
-            # Mapear encabezados a nombres de campo estándar
-            header_mapping = {
-                'fecha_primer_pago': 'fecha',
-                'detalle': 'detalle',
-                'monto_usd': 'montoUSD',
-                'monto_cop': 'montoCOP',
-                'categoría': 'categoria',
-                'pagada_con': 'pagadaCon',
-                'pagada_por': 'pagadaPor',
-                'estado': 'estado'
+            # Insertar los valores en la hoja
+            body = {
+                'values': values
             }
             
-            # Crear una lista de diccionarios con los datos
-            subscriptions = []
-            for row in values[1:]:  # Saltar la primera fila (encabezados)
-                if len(row) < len(headers):  # Asegurarse de que la fila tiene suficientes columnas
-                    row.extend([''] * (len(headers) - len(row)))  # Rellenar con valores vacíos si faltan
-                
-                # Crear diccionario con los nombres de campo normalizados
-                subscription = {}
-                for field_name, field_value in zip(normalized_headers, row):
-                    if field_name in header_mapping:
-                        mapped_name = header_mapping[field_name]
-                        subscription[mapped_name] = field_value
-                    else:
-                        # Para campos que no están en el mapeo, usar el nombre original
-                        subscription[field_name] = field_value
-                
-                # Asegurarse de que todos los campos necesarios existan
-                required_fields = ['fecha', 'detalle', 'montoUSD', 'estado']
-                if all(field in subscription for field in required_fields):
-                    subscriptions.append(subscription)
-                else:
-                    missing = [field for field in required_fields if field not in subscription]
-                    logger.warning(f"Fila ignorada por falta de campos: {missing}. Valores: {row}")
+            result = service.spreadsheets().values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{self.expenses_sheet_name}'!A{next_row}",
+                valueInputOption='RAW',
+                body=body
+            ).execute()
             
-            logger.info(f"Se cargaron {len(subscriptions)} suscripciones desde Google Sheets")
-            return subscriptions
-        
+            rows_updated = result.get('updatedRows', 0)
+            logger.info(f"Se registraron {rows_updated} gastos en la hoja de gastos")
+            
+            return True
+            
         except Exception as e:
-            logger.error(f"Error al cargar datos desde Google Sheets: {e}")
-            return []
+            logger.error(f"Error al registrar gastos en la hoja de gastos: {e}")
+            return False
     
-    def get_due_subscriptions(self, today=None):
+    def register_in_movements_sheet(self, subscriptions):
         """
-        Obtiene las suscripciones que se causan hoy o en la fecha especificada.
+        Registra los gastos recurrentes en la hoja de movimientos de caja con valores negativos.
         
         Args:
-            today (datetime.datetime): Fecha para verificar las suscripciones. Si es None, se usa la fecha actual.
+            subscriptions (list): Lista de suscripciones a registrar.
             
         Returns:
-            list: Lista de suscripciones a notificar.
+            bool: True si se registraron correctamente, False en caso contrario.
         """
-        if today is None:
+        try:
+            service = self.get_service()
+            if not service:
+                logger.error("No se pudo obtener el servicio de Google Sheets")
+                return False
+            
+            # Verificar si la hoja de movimientos existe
+            sheet_exists = self.check_sheet_exists(self.movements_sheet_name)
+            if not sheet_exists:
+                logger.error(f"La hoja '{self.movements_sheet_name}' no existe en el documento")
+                return False
+            
+            # Fecha actual para el registro
             today = datetime.now()
-        
-        logger.info(f"Verificando suscripciones para la fecha: {today.strftime('%d/%m/%Y')}")
-        
-        # Cargar las suscripciones desde Google Sheets
-        subscriptions = self.load_subscriptions()
-        
-        due_subs = []
-        
-        for sub in subscriptions:
-            # Convertir la fecha de string a objeto datetime
-            try:
-                # Asegurarse de que el formato de fecha sea el correcto (dd/mm/yyyy)
-                original_date = datetime.strptime(sub["fecha"], "%d/%m/%Y")
+            formatted_date = self.format_date_for_accounting(today)
+            
+            # Preparar los valores a insertar
+            values = []
+            for sub in subscriptions:
+                # Obtener el monto en COP y convertirlo a negativo (como número)
+                monto_cop = -abs(self.extract_numeric_value(sub.get('montoCOP', '0')))
                 
-                # Verificar si hoy es el día mensual correspondiente a la fecha original
-                # Y si la suscripción está activa (basado únicamente en el estado de la columna H)
-                if (original_date.day == today.day and 
-                    sub["estado"].lower() == "activo"):
-                    due_subs.append(sub)
-                    logger.info(f"Suscripción por causar hoy: {sub['detalle']}")
-            except ValueError as e:
-                logger.error(f"Error de formato de fecha para {sub.get('detalle', 'desconocido')}: {e}")
+                # Crear una fila para cada suscripción
+                # [Fecha, Detalle, Monto COP (negativo)]
+                row = [
+                    formatted_date,  # Fecha en formato MM/DD/YYYY
+                    f"Gasto recurrente: {sub.get('detalle', 'Sin detalles')}",  # Detalle
+                    monto_cop  # Monto COP como número negativo
+                ]
+                values.append(row)
+            
+            # Obtener la siguiente fila disponible
+            result = service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{self.movements_sheet_name}'!A:A"
+            ).execute()
+            
+            existing_rows = result.get('values', [])
+            next_row = len(existing_rows) + 1
+            
+            # Insertar los valores en la hoja
+            body = {
+                'values': values
+            }
+            
+            result = service.spreadsheets().values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{self.movements_sheet_name}'!A{next_row}",
+                valueInputOption='RAW',
+                body=body
+            ).execute()
+            
+            rows_updated = result.get('updatedRows', 0)
+            logger.info(f"Se registraron {rows_updated} movimientos en la hoja de movimientos de caja")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error al registrar movimientos en la hoja de movimientos de caja: {e}")
+            return False
+    
+    def check_sheet_exists(self, sheet_name):
+        """
+        Verifica si una hoja existe en el documento.
         
-        if not due_subs:
-            logger.info("No hay suscripciones por cobrar hoy.")
+        Args:
+            sheet_name (str): Nombre de la hoja a verificar.
+            
+        Returns:
+            bool: True si la hoja existe, False en caso contrario.
+        """
+        try:
+            service = self.get_service()
+            if not service:
+                return False
+                
+            # Obtener todas las hojas del documento
+            result = service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id,
+                fields='sheets.properties.title'
+            ).execute()
+            
+            # Verificar si la hoja existe
+            for sheet in result.get('sheets', []):
+                if sheet.get('properties', {}).get('title') == sheet_name:
+                    logger.info(f"Hoja '{sheet_name}' encontrada")
+                    return True
+            
+            logger.error(f"Hoja '{sheet_name}' no encontrada. Hojas disponibles:")
+            for sheet in result.get('sheets', []):
+                logger.error(f"- {sheet.get('properties', {}).get('title')}")
+            
+            return False
         
-        return due_subs
+        except Exception as e:
+            logger.error(f"Error al verificar si la hoja '{sheet_name}' existe: {e}")
+            return False
+    
+    def test_connection(self):
+        """
+        Prueba la conexión con las hojas de contabilidad.
+        
+        Returns:
+            bool: True si la conexión es exitosa, False en caso contrario.
+        """
+        service = self.get_service()
+        if not service:
+            logger.error("No se pudo obtener el servicio de Google Sheets")
+            return False
+        
+        try:
+            # Mostrar todas las hojas disponibles para facilitar la depuración
+            result = service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id,
+                fields='sheets.properties.title'
+            ).execute()
+            
+            sheets = [sheet.get('properties', {}).get('title') for sheet in result.get('sheets', [])]
+            logger.info(f"Hojas disponibles en el documento: {', '.join(sheets)}")
+            
+            # Verificar si las hojas existen
+            expenses_sheet_found = self.check_sheet_exists(self.expenses_sheet_name)
+            movements_sheet_found = self.check_sheet_exists(self.movements_sheet_name)
+            
+            if expenses_sheet_found and movements_sheet_found:
+                logger.info(f"Conexión exitosa con ambas hojas de contabilidad")
+                return True
+            elif expenses_sheet_found:
+                logger.error(f"La hoja '{self.movements_sheet_name}' no existe en el documento")
+                return False
+            elif movements_sheet_found:
+                logger.error(f"La hoja '{self.expenses_sheet_name}' no existe en el documento")
+                return False
+            else:
+                logger.error(f"Las hojas '{self.expenses_sheet_name}' y '{self.movements_sheet_name}' no existen en el documento")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error al conectar con las hojas de contabilidad: {e}")
+            return False
 
 
 # Para uso como script independiente
@@ -173,16 +332,27 @@ if __name__ == "__main__":
     load_dotenv()
     
     # Crear instancia del servicio
-    sheets_service = SheetsService()
+    accounting_service = AccountingService()
     
-    # Probar carga de suscripciones
-    subscriptions = sheets_service.load_subscriptions()
-    print(f"Se cargaron {len(subscriptions)} suscripciones:")
-    for sub in subscriptions[:5]:  # Mostrar solo las primeras 5 para no saturar la salida
-        print(f"- {sub.get('detalle', 'Sin detalle')}: {sub.get('montoUSD', '0')} USD ({sub.get('estado', 'Sin estado')})")
-    
-    # Probar obtención de suscripciones del día
-    due_today = sheets_service.get_due_subscriptions()
-    print(f"\nSuscripciones que se causan hoy: {len(due_today)}")
-    for sub in due_today:
-        print(f"- {sub.get('detalle', 'Sin detalle')}: {sub.get('montoUSD', '0')} USD")
+    # Probar conexión
+    if accounting_service.test_connection():
+        print("✅ Conexión exitosa con las hojas de contabilidad")
+        
+        # Prueba de registro (ejemplo)
+        test_subscription = [{
+            "fecha": datetime.now().strftime("%d/%m/%Y"),
+            "detalle": "Suscripción de Prueba",
+            "montoUSD": "$25",
+            "montoCOP": "$100,000",
+            "categoria": "Prueba"
+        }]
+        
+        # Preguntar antes de registrar
+        answer = input("¿Deseas registrar un gasto de prueba en ambas hojas? (s/n): ")
+        if answer.lower() == 's':
+            if accounting_service.register_expenses(test_subscription):
+                print("✅ Registro de prueba exitoso en ambas hojas")
+            else:
+                print("❌ Error al registrar el gasto de prueba")
+    else:
+        print("❌ Error al conectar con las hojas de contabilidad")
